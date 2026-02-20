@@ -134,7 +134,7 @@ Gemini가 참조할 규정 데이터. 카테고리별 별도 시트.
 
 | 컬럼 | 타입 | 설명 | 예시 |
 |------|------|------|------|
-| sessionId | string | 세션 ID (userId_날짜) | user123_20260219 |
+| sessionId | string | 세션 ID (userId + 시작시각 해시) | user123_20260219T1430 |
 | userId | string | 네이버웍스 사용자 ID | user123 |
 | timestamp | datetime | 메시지 시각 | 2026-02-19 14:30:00 |
 | role | string | 발화자 (user / bot) | user |
@@ -145,10 +145,11 @@ Gemini가 참조할 규정 데이터. 카테고리별 별도 시트.
 
 ### 멀티턴 대화 이력 관리 규칙
 
-- **조회 범위**: 동일 userId의 최근 5건 + 30분 이내
-- **30분 초과** 시 새 세션으로 취급 (sessionId 갱신)
+- **조회 범위**: 동일 `sessionId`의 최근 6턴(예: 사용자 3 + 봇 3)
+- **권장 세션 타임아웃**: 마지막 사용자 메시지 기준 20분
+- **20분 초과** 시 새 세션으로 취급 (`sessionId` 갱신), 기존 세션 문맥 미참조
 - **이력 정리**: 7일 이상 지난 이력은 월 1회 아카이빙 (별도 시트 이동)
-- **용도**: Gemini 호출 시 conversation history로 전달
+- **용도**: Gemini 호출 시 해당 세션 `conversationHistory`만 전달
 
 ---
 

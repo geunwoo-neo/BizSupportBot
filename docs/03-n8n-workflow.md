@@ -178,6 +178,8 @@ return [{
     domainId: body.source.domainId,
     messageText: body.content.text.trim(),
     timestamp: body.issuedTime || new Date().toISOString(),
+    sessionTimeoutMin: 20,
+    maxTurnsInContext: 6,
     skip: false
   }
 }];
@@ -187,7 +189,7 @@ return [{
 
 #### Node 3: Google Sheets — fetchHistory
 
-멀티턴 대화를 위한 최근 대화 이력 조회.
+동일 사용자의 최근 이력을 읽고, **활성 세션 1개**만 선택해 멀티턴 문맥으로 사용.
 
 - **타입**: Google Sheets (Read)
 - **Spreadsheet**: BizSupportBot_Data
@@ -197,19 +199,35 @@ return [{
 
 **후처리 (Function 노드 연결):**
 ```javascript
-// 30분 이내 + 최근 5건만 필터링
-const now = new Date();
-const thirtyMinAgo = new Date(now - 30 * 60 * 1000);
-const userId = $('parseMessage').first().json.userId;
+const parsed = $('parseMessage').first().json;
+const userId = parsed.userId;
+const now = new Date(parsed.timestamp || new Date().toISOString());
+const timeoutMin = Number(parsed.sessionTimeoutMin || 20);
+const timeoutAgo = new Date(now.getTime() - timeoutMin * 60 * 1000);
+const maxTurns = Number(parsed.maxTurnsInContext || 6);
 
-const recentHistory = $input.all()
+const rows = $input.all()
   .map(item => item.json)
-  .filter(row => row.userId === userId && new Date(row.timestamp) > thirtyMinAgo)
-  .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
-  .slice(0, 5)
-  .reverse(); // 시간순 정렬
+  .filter(row => row.userId === userId)
+  .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 
-return [{ json: { conversationHistory: recentHistory } }];
+const latest = rows[0];
+const activeSessionId = (latest && new Date(latest.timestamp) >= timeoutAgo)
+  ? latest.sessionId
+  : `S_${userId}_${now.toISOString().replace(/[-:]/g, '').slice(0, 12)}`;
+
+const conversationHistory = rows
+  .filter(row => row.sessionId === activeSessionId)
+  .slice(0, maxTurns)
+  .reverse();
+
+return [{
+  json: {
+    sessionId: activeSessionId,
+    isNewSession: conversationHistory.length === 0,
+    conversationHistory
+  }
+}];
 ```
 
 ---
@@ -357,7 +375,7 @@ FAQ 미매칭 시 Gemini로 의도 분류.
     {
       "role": "user",
       "parts": [{
-        "text": "다음 사용자 메시지를 분류해주세요.\n\n[사용자 메시지]\n{{$('parseMessage').first().json.messageText}}\n\n[이전 대화]\n{{$('fetchHistory').first().json.conversationHistory}}\n\n아래 JSON 형식으로만 응답하세요:\n{\"category\": \"인사|총무|회계|기타\", \"subCategory\": \"소분류명\", \"isAnswerable\": true|false, \"confidence\": 0.0~1.0}\n\n- category: 인사, 총무, 회계 중 하나. 해당 없으면 기타\n- isAnswerable: 경영지원 규정으로 답변 가능한 질문이면 true\n- confidence: 분류 확신도 (0.0~1.0)"
+        "text": "다음 사용자 메시지를 분류해주세요.\n\n[사용자 메시지]\n{{$('parseMessage').first().json.messageText}}\n\n[현재 세션 대화]\n{{$('fetchHistory').first().json.conversationHistory}}\n\n아래 JSON 형식으로만 응답하세요:\n{\"category\": \"인사|총무|회계|기타\", \"subCategory\": \"소분류명\", \"isAnswerable\": true|false, \"confidence\": 0.0~1.0}\n\n- category: 인사, 총무, 회계 중 하나. 해당 없으면 기타\n- isAnswerable: 경영지원 규정으로 답변 가능한 질문이면 true\n- confidence: 분류 확신도 (0.0~1.0)"
       }]
     }
   ],
@@ -488,7 +506,7 @@ return [{ json: { regulations: limited } }];
     {
       "role": "user",
       "parts": [{
-        "text": "[참조 규정]\n{{$('fetchRegulations').first().json.regulations}}\n\n[이전 대화]\n{{$('fetchHistory').first().json.conversationHistory}}\n\n[사용자 질문]\n{{$('parseMessage').first().json.messageText}}\n\n위 규정을 기반으로 답변해주세요. JSON 형식으로 응답:\n{\"answer\": \"답변 내용\", \"source\": \"근거 규정\", \"confidence\": 0.0~1.0}"
+        "text": "[참조 규정]\n{{$('fetchRegulations').first().json.regulations}}\n\n[현재 세션 대화]\n{{$('fetchHistory').first().json.conversationHistory}}\n\n[사용자 질문]\n{{$('parseMessage').first().json.messageText}}\n\n위 규정을 기반으로 답변해주세요. JSON 형식으로 응답:\n{\"answer\": \"답변 내용\", \"source\": \"근거 규정\", \"confidence\": 0.0~1.0}"
       }]
     }
   ],
@@ -548,7 +566,7 @@ return [{
 ```javascript
 const userId = $('parseMessage').first().json.userId;
 const now = new Date().toISOString();
-const sessionId = `${userId}_${now.split('T')[0].replace(/-/g, '')}`;
+const sessionId = $('fetchHistory').first().json.sessionId;
 
 return [
   // 사용자 메시지
