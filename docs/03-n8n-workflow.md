@@ -89,7 +89,9 @@ return [{ json: { jwt } }];
 ### 전체 노드 흐름
 
 ```
-[1. Webhook] ─→ [2. parseMessage] ─→ [3. fetchHistory]
+[1. Webhook] ─→ [2. parseMessage] ─→ [2-1. sendProcessingAck]
+                                          ↓
+                                     [3. fetchHistory]
                                           ↓
                                    [4. fetchFaqIndex]
                                           ↓
@@ -100,25 +102,27 @@ return [{ json: { jwt } }];
                                     [7. matchFAQ]
                                           ↓
                                     [8. IF: faqMatched?]
-                                     ├─ YES → [9. formatFAQResponse] ──────────┐
-                                     └─ NO  → [10. classifyIntent (Gemini)] ─→ │
-                                                     ↓                          │
-                                               [11. IF: isAnswerable?]          │
-                                                ├─ NO → [12. fetchContact]      │
-                                                │            ↓                   │
-                                                │       [13. formatEscalation]───┤
-                                                └─ YES ↓                        │
-                                               [14. fetchRegulations]            │
-                                                     ↓                           │
-                                               [15. generateResponse (Gemini)]   │
-                                                     ↓                           │
-                                               [16. formatResponse] ─────────────┤
-                                                                                ↓
-                                                                   [17. saveHistory]
-                                                                          ↓
-                                                                   [18. getToken (Sub)]
-                                                                          ↓
-                                                                   [19. sendMessage]
+                                     ├─ YES → [9. formatFAQResponse] ───────────────┐
+                                     └─ NO  → [10. classifyIntent (Gemini)]         │
+                                                     ↓                                │
+                                        [10-1. IF: needsClarification?]              │
+                                         ├─ YES → [10-2. formatClarification] ───────┤
+                                         └─ NO  → [11. IF: isAnswerable?]             │
+                                                       ├─ NO → [12. fetchContact]     │
+                                                       │            ↓                  │
+                                                       │       [13. formatEscalation]──┤
+                                                       └─ YES ↓                       │
+                                                      [14. fetchRegulations]           │
+                                                            ↓                          │
+                                                      [15. generateResponse (Gemini)]  │
+                                                            ↓                          │
+                                                      [16. formatResponse] ────────────┤
+                                                                                        ↓
+                                                                           [17. saveHistory]
+                                                                                  ↓
+                                                                           [18. getToken (Sub)]
+                                                                                  ↓
+                                                                           [19. sendMessage]
 ```
 
 ### 노드별 상세 설계
@@ -184,6 +188,28 @@ return [{
   }
 }];
 ```
+
+---
+
+#### Node 2-1: HTTP Request — sendProcessingAck
+
+사용자가 "응답이 멈췄다"고 느끼지 않도록 선제 안내 메시지를 즉시 전송.
+
+- **타입**: HTTP Request
+- **Method**: POST
+- **URL**: `https://www.worksapis.com/v1.0/bots/{{$env.NAVER_WORKS_BOT_ID}}/users/{{$('parseMessage').first().json.userId}}/messages`
+- **Body**:
+
+```json
+{
+  "content": {
+    "type": "text",
+    "text": "문의 내용을 확인하고 있습니다. 잠시만 기다려주세요."
+  }
+}
+```
+
+> 권장: 최종 응답이 2초 이상 걸릴 수 있는 흐름(Tier2/Tier3)에서는 항상 활성화.
 
 ---
 
@@ -395,7 +421,38 @@ return [{
     category: result.category,
     subCategory: result.subCategory,
     isAnswerable: result.isAnswerable && result.category !== '기타',
-    confidence: result.confidence
+    confidence: result.confidence,
+    needsClarification: Boolean(result.needsClarification),
+    clarificationQuestion: result.clarificationQuestion || ''
+  }
+}];
+```
+
+---
+
+#### Node 10-1: IF — needsClarification?
+
+- **타입**: IF
+- **Condition**: `{{$json.needsClarification}}` equals `true`
+- **True**: → Node 10-2 (formatClarification)
+- **False**: → Node 11 (isAnswerable?)
+
+---
+
+#### Node 10-2: Function — formatClarification
+
+모호 질문에는 정답 추정 대신 범위를 좁히는 질문을 1회 반환.
+
+```javascript
+const q = $json.clarificationQuestion || '문의하신 휴가 유형(연차/경조휴가/병가) 중 어떤 항목인지 알려주세요.';
+
+return [{
+  json: {
+    responseText: `정확한 안내를 위해 확인이 필요합니다.
+${q}`,
+    tier: 'clarify',
+    category: $json.category || '기타',
+    isEscalated: false
   }
 }];
 ```
@@ -407,7 +464,7 @@ return [{
 - **타입**: IF
 - **Condition**: `{{$json.isAnswerable}}` equals `true`
 - **True**: → Node 12 (fetchRegulations)
-- **False**: → Node 10 (fetchContact)
+- **False**: → Node 12 (fetchContact)
 
 ---
 
