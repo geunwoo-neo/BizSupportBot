@@ -28,7 +28,7 @@ n8n 워크플로우의 Node 13 (generateResponse)에서 Gemini API `systemInstru
 
 ## 이전 대화 처리
 
-[이전 대화]가 제공되면 맥락을 고려하여 답변하세요.
+[현재 세션 대화]가 제공되면 맥락을 고려하여 답변하세요.
 - "그건?", "그럼?", "신청은?" 같은 후속 질문은 이전 대화의 주제를 이어받습니다.
 - 이전 대화와 관련 없는 새 질문이면 독립적으로 답변하세요.
 
@@ -54,7 +54,7 @@ n8n 워크플로우의 Node 13 (generateResponse)에서 Gemini API `systemInstru
 
 ## 의도 분류 프롬프트 (v1)
 
-n8n 워크플로우의 Node 8 (classifyIntent)에서 사용.
+n8n 워크플로우의 Node 10 (classifyIntent)에서 사용.
 
 ```
 다음 사용자 메시지를 분류해주세요.
@@ -62,7 +62,7 @@ n8n 워크플로우의 Node 8 (classifyIntent)에서 사용.
 [사용자 메시지]
 {userMessage}
 
-[이전 대화]
+[현재 세션 대화]
 {conversationHistory}
 
 아래 JSON 형식으로만 응답하세요:
@@ -70,7 +70,9 @@ n8n 워크플로우의 Node 8 (classifyIntent)에서 사용.
   "category": "인사|총무|회계|기타",
   "subCategory": "소분류명",
   "isAnswerable": true 또는 false,
-  "confidence": 0.0~1.0
+  "confidence": 0.0~1.0,
+  "needsClarification": true 또는 false,
+  "clarificationQuestion": "사용자에게 되물을 질문"
 }
 
 분류 기준:
@@ -81,6 +83,8 @@ n8n 워크플로우의 Node 8 (classifyIntent)에서 사용.
 
 - isAnswerable: 경영지원 규정으로 답변 가능하면 true, 불가능하면 false
 - "기타" 카테고리는 항상 isAnswerable: false
+- 현재 세션 대화만 문맥으로 사용하고, 이전 세션 정보는 추정하지 않음
+- 질문이 모호하면 needsClarification=true로 반환하고, clarificationQuestion에 좁히는 질문을 작성
 ```
 
 ---
@@ -101,5 +105,5 @@ n8n 워크플로우의 Node 8 (classifyIntent)에서 사용.
 | 답변이 너무 김 | "200자 이내" 제한 강화 |
 | 에스컬레이션 과다 | confidence 임계값 조정 (0.7 → 0.6) |
 | 에스컬레이션 과소 | confidence 임계값 조정 (0.7 → 0.8) |
-| 멀티턴 맥락 무시 | [이전 대화] 전달 방식 확인, 프롬프트에 맥락 참조 지시 강화 |
+| 멀티턴 맥락 무시 | [현재 세션 대화] 전달 방식 확인, 프롬프트에 맥락 참조 지시 강화 |
 | 카테고리 오분류 | 의도 분류 프롬프트의 분류 기준에 예시 추가 |

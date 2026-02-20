@@ -89,32 +89,40 @@ return [{ json: { jwt } }];
 ### 전체 노드 흐름
 
 ```
-[1. Webhook] ─→ [2. parseMessage] ─→ [3. fetchHistory]
+[1. Webhook] ─→ [2. parseMessage] ─→ [2-1. sendProcessingAck]
                                           ↓
-                                    [4. fetchFAQ]
+                                     [3. fetchHistory]
                                           ↓
-                                    [5. matchFAQ]
+                                   [4. fetchFaqIndex]
                                           ↓
-                                    [6. IF: faqMatched?]
-                                     ├─ YES → [7. formatFAQResponse] ──────────┐
-                                     └─ NO  → [8. classifyIntent (Gemini)] ─→  │
-                                                    ↓                          │
-                                              [9. IF: isAnswerable?]           │
-                                               ├─ NO → [10. fetchContact]     │
-                                               │            ↓                  │
-                                               │       [11. formatEscalation]──┤
-                                               └─ YES ↓                       │
-                                              [12. fetchRegulations]           │
-                                                    ↓                          │
-                                              [13. generateResponse (Gemini)]  │
-                                                    ↓                          │
-                                              [14. formatResponse] ────────────┤
-                                                                               ↓
-                                                                  [15. saveHistory]
-                                                                         ↓
-                                                                  [16. getToken (Sub)]
-                                                                         ↓
-                                                                  [17. sendMessage]
+                                 [5. selectFaqCandidates]
+                                          ↓
+                                [6. fetchFaqCandidates]
+                                          ↓
+                                    [7. matchFAQ]
+                                          ↓
+                                    [8. IF: faqMatched?]
+                                     ├─ YES → [9. formatFAQResponse] ───────────────┐
+                                     └─ NO  → [10. classifyIntent (Gemini)]         │
+                                                     ↓                                │
+                                        [10-1. IF: needsClarification?]              │
+                                         ├─ YES → [10-2. formatClarification] ───────┤
+                                         └─ NO  → [11. IF: isAnswerable?]             │
+                                                       ├─ NO → [12. fetchContact]     │
+                                                       │            ↓                  │
+                                                       │       [13. formatEscalation]──┤
+                                                       └─ YES ↓                       │
+                                                      [14. fetchRegulations]           │
+                                                            ↓                          │
+                                                      [15. generateResponse (Gemini)]  │
+                                                            ↓                          │
+                                                      [16. formatResponse] ────────────┤
+                                                                                        ↓
+                                                                           [17. saveHistory]
+                                                                                  ↓
+                                                                           [18. getToken (Sub)]
+                                                                                  ↓
+                                                                           [19. sendMessage]
 ```
 
 ### 노드별 상세 설계
@@ -174,6 +182,8 @@ return [{
     domainId: body.source.domainId,
     messageText: body.content.text.trim(),
     timestamp: body.issuedTime || new Date().toISOString(),
+    sessionTimeoutMin: 20,
+    maxTurnsInContext: 6,
     skip: false
   }
 }];
@@ -181,9 +191,31 @@ return [{
 
 ---
 
+#### Node 2-1: HTTP Request — sendProcessingAck
+
+사용자가 "응답이 멈췄다"고 느끼지 않도록 선제 안내 메시지를 즉시 전송.
+
+- **타입**: HTTP Request
+- **Method**: POST
+- **URL**: `https://www.worksapis.com/v1.0/bots/{{$env.NAVER_WORKS_BOT_ID}}/users/{{$('parseMessage').first().json.userId}}/messages`
+- **Body**:
+
+```json
+{
+  "content": {
+    "type": "text",
+    "text": "문의 내용을 확인하고 있습니다. 잠시만 기다려주세요."
+  }
+}
+```
+
+> 권장: 최종 응답이 2초 이상 걸릴 수 있는 흐름(Tier2/Tier3)에서는 항상 활성화.
+
+---
+
 #### Node 3: Google Sheets — fetchHistory
 
-멀티턴 대화를 위한 최근 대화 이력 조회.
+동일 사용자의 최근 이력을 읽고, **활성 세션 1개**만 선택해 멀티턴 문맥으로 사용.
 
 - **타입**: Google Sheets (Read)
 - **Spreadsheet**: BizSupportBot_Data
@@ -193,69 +225,129 @@ return [{
 
 **후처리 (Function 노드 연결):**
 ```javascript
-// 30분 이내 + 최근 5건만 필터링
-const now = new Date();
-const thirtyMinAgo = new Date(now - 30 * 60 * 1000);
-const userId = $('parseMessage').first().json.userId;
+const parsed = $('parseMessage').first().json;
+const userId = parsed.userId;
+const now = new Date(parsed.timestamp || new Date().toISOString());
+const timeoutMin = Number(parsed.sessionTimeoutMin || 20);
+const timeoutAgo = new Date(now.getTime() - timeoutMin * 60 * 1000);
+const maxTurns = Number(parsed.maxTurnsInContext || 6);
 
-const recentHistory = $input.all()
+const rows = $input.all()
   .map(item => item.json)
-  .filter(row => row.userId === userId && new Date(row.timestamp) > thirtyMinAgo)
-  .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
-  .slice(0, 5)
-  .reverse(); // 시간순 정렬
+  .filter(row => row.userId === userId)
+  .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 
-return [{ json: { conversationHistory: recentHistory } }];
+const latest = rows[0];
+const activeSessionId = (latest && new Date(latest.timestamp) >= timeoutAgo)
+  ? latest.sessionId
+  : `S_${userId}_${now.toISOString().replace(/[-:]/g, '').slice(0, 12)}`;
+
+const conversationHistory = rows
+  .filter(row => row.sessionId === activeSessionId)
+  .slice(0, maxTurns)
+  .reverse();
+
+return [{
+  json: {
+    sessionId: activeSessionId,
+    isNewSession: conversationHistory.length === 0,
+    conversationHistory
+  }
+}];
 ```
 
 ---
 
-#### Node 4: Google Sheets — fetchFAQ
+#### Node 4: Google Sheets — fetchFaqIndex
 
-FAQ 데이터 전체 조회.
+FAQ 인덱스(키워드 → faqId 목록) 조회.
 
 - **타입**: Google Sheets (Read)
-- **Sheet**: FAQ
-- **Filter**: `isActive` = `TRUE`
+- **Sheet**: FAQ_키워드인덱스
+- **Filter**: 없음 (초기에는 전체 조회 후 staticData 캐시, 이후 5분 TTL 갱신)
 
-> **성능 팁**: FAQ가 100건 이하면 전체 조회 후 n8n 내에서 매칭해도 충분.
-> 100건 이상이면 Google Sheets API의 filter 파라미터 활용.
+> **운영 기준**
+> - FAQ 150행 미만: 기존 `fetchFAQ` 전량 조회 허용
+> - FAQ 150행 이상: 인덱스 기반 후보 추출을 기본값으로 전환
 
 ---
 
-#### Node 5: Function — matchFAQ
+#### Node 5: Function — selectFaqCandidates
 
-사용자 메시지와 FAQ 키워드를 매칭.
+사용자 메시지에서 후보 FAQ ID 집합을 추출.
 
 - **타입**: Code (JavaScript)
 
 ```javascript
-const userMessage = $('parseMessage').first().json.messageText;
-const faqList = $('fetchFAQ').all().map(item => item.json);
+const userMessageRaw = $('parseMessage').first().json.messageText || '';
+const userMessage = userMessageRaw.toLowerCase().replace(/\s+/g, '');
+const indexRows = $('fetchFaqIndex').all().map(item => item.json);
 
-// 키워드 매칭: FAQ의 keywords 중 하나라도 사용자 메시지에 포함되면 매칭
+const candidateScore = new Map();
+
+for (const row of indexRows) {
+  const keyword = (row.keyword || '').toLowerCase().replace(/\s+/g, '');
+  const synonyms = (row.synonyms || '')
+    .split(',')
+    .map(v => v.trim().toLowerCase().replace(/\s+/g, ''))
+    .filter(Boolean);
+
+  const matched = [keyword, ...synonyms].some(token => token && userMessage.includes(token));
+  if (!matched) continue;
+
+  const weight = Number(row.weight || 1);
+  const faqIds = (row.faqIds || '').split(',').map(v => v.trim()).filter(Boolean);
+
+  for (const faqId of faqIds) {
+    candidateScore.set(faqId, (candidateScore.get(faqId) || 0) + weight);
+  }
+}
+
+const topCandidateIds = [...candidateScore.entries()]
+  .sort((a, b) => b[1] - a[1])
+  .slice(0, 10)
+  .map(([faqId]) => faqId);
+
+return [{ json: { topCandidateIds, candidateScore: Object.fromEntries(candidateScore) } }];
+```
+
+---
+
+#### Node 6: Google Sheets — fetchFaqCandidates
+
+후보 FAQ ID에 해당하는 FAQ 본문만 조회.
+
+- **타입**: Google Sheets (Read)
+- **Sheet**: FAQ
+- **Filter**: `faqId in topCandidateIds` + `isActive = TRUE`
+
+---
+
+#### Node 7: Function — matchFAQ
+
+후보 FAQ만 스코어링해 최종 매칭.
+
+```javascript
+const userMessage = $('parseMessage').first().json.messageText || '';
+const candidateFaqs = $('fetchFaqCandidates').all().map(item => item.json);
+const baseScore = $('selectFaqCandidates').first().json.candidateScore || {};
+
 let bestMatch = null;
-let maxKeywordCount = 0;
+let bestScore = 0;
 
-for (const faq of faqList) {
-  const keywords = faq.keywords.split(',').map(k => k.trim());
+for (const faq of candidateFaqs) {
+  const keywords = (faq.keywords || '').split(',').map(k => k.trim()).filter(Boolean);
   const matchedCount = keywords.filter(kw => userMessage.includes(kw)).length;
+  const score = (baseScore[faq.faqId] || 0) + matchedCount * 2;
 
-  if (matchedCount > maxKeywordCount) {
-    maxKeywordCount = matchedCount;
+  if (score > bestScore) {
+    bestScore = score;
     bestMatch = faq;
   }
 }
 
-// 최소 1개 이상 키워드 매칭 필요
-if (bestMatch && maxKeywordCount >= 1) {
-  return [{
-    json: {
-      faqMatched: true,
-      matchedFAQ: bestMatch,
-      matchedKeywords: maxKeywordCount
-    }
-  }];
+if (bestMatch && bestScore >= 2) {
+  return [{ json: { faqMatched: true, matchedFAQ: bestMatch, matchedScore: bestScore } }];
 }
 
 return [{ json: { faqMatched: false } }];
@@ -263,16 +355,16 @@ return [{ json: { faqMatched: false } }];
 
 ---
 
-#### Node 6: IF — faqMatched?
+#### Node 8: IF — faqMatched?
 
 - **타입**: IF
 - **Condition**: `{{$json.faqMatched}}` equals `true`
-- **True**: → Node 7 (formatFAQResponse)
-- **False**: → Node 8 (classifyIntent)
+- **True**: → Node 9 (formatFAQResponse)
+- **False**: → Node 10 (classifyIntent)
 
 ---
 
-#### Node 7: Function — formatFAQResponse
+#### Node 9: Function — formatFAQResponse
 
 FAQ 매칭 시 즉시 응답 포맷팅.
 
@@ -293,7 +385,7 @@ return [{
 
 ---
 
-#### Node 8: HTTP Request — classifyIntent (Gemini)
+#### Node 10: HTTP Request — classifyIntent (Gemini)
 
 FAQ 미매칭 시 Gemini로 의도 분류.
 
@@ -309,7 +401,7 @@ FAQ 미매칭 시 Gemini로 의도 분류.
     {
       "role": "user",
       "parts": [{
-        "text": "다음 사용자 메시지를 분류해주세요.\n\n[사용자 메시지]\n{{$('parseMessage').first().json.messageText}}\n\n[이전 대화]\n{{$('fetchHistory').first().json.conversationHistory}}\n\n아래 JSON 형식으로만 응답하세요:\n{\"category\": \"인사|총무|회계|기타\", \"subCategory\": \"소분류명\", \"isAnswerable\": true|false, \"confidence\": 0.0~1.0}\n\n- category: 인사, 총무, 회계 중 하나. 해당 없으면 기타\n- isAnswerable: 경영지원 규정으로 답변 가능한 질문이면 true\n- confidence: 분류 확신도 (0.0~1.0)"
+        "text": "다음 사용자 메시지를 분류해주세요.\n\n[사용자 메시지]\n{{$('parseMessage').first().json.messageText}}\n\n[현재 세션 대화]\n{{$('fetchHistory').first().json.conversationHistory}}\n\n아래 JSON 형식으로만 응답하세요:\n{\"category\": \"인사|총무|회계|기타\", \"subCategory\": \"소분류명\", \"isAnswerable\": true|false, \"confidence\": 0.0~1.0}\n\n- category: 인사, 총무, 회계 중 하나. 해당 없으면 기타\n- isAnswerable: 경영지원 규정으로 답변 가능한 질문이면 true\n- confidence: 분류 확신도 (0.0~1.0)"
       }]
     }
   ],
@@ -329,23 +421,54 @@ return [{
     category: result.category,
     subCategory: result.subCategory,
     isAnswerable: result.isAnswerable && result.category !== '기타',
-    confidence: result.confidence
+    confidence: result.confidence,
+    needsClarification: Boolean(result.needsClarification),
+    clarificationQuestion: result.clarificationQuestion || ''
   }
 }];
 ```
 
 ---
 
-#### Node 9: IF — isAnswerable?
+#### Node 10-1: IF — needsClarification?
+
+- **타입**: IF
+- **Condition**: `{{$json.needsClarification}}` equals `true`
+- **True**: → Node 10-2 (formatClarification)
+- **False**: → Node 11 (isAnswerable?)
+
+---
+
+#### Node 10-2: Function — formatClarification
+
+모호 질문에는 정답 추정 대신 범위를 좁히는 질문을 1회 반환.
+
+```javascript
+const q = $json.clarificationQuestion || '문의하신 휴가 유형(연차/경조휴가/병가) 중 어떤 항목인지 알려주세요.';
+
+return [{
+  json: {
+    responseText: `정확한 안내를 위해 확인이 필요합니다.
+${q}`,
+    tier: 'clarify',
+    category: $json.category || '기타',
+    isEscalated: false
+  }
+}];
+```
+
+---
+
+#### Node 11: IF — isAnswerable?
 
 - **타입**: IF
 - **Condition**: `{{$json.isAnswerable}}` equals `true`
 - **True**: → Node 12 (fetchRegulations)
-- **False**: → Node 10 (fetchContact)
+- **False**: → Node 12 (fetchContact)
 
 ---
 
-#### Node 10: Google Sheets — fetchContact
+#### Node 12: Google Sheets — fetchContact
 
 에스컬레이션용 담당자 조회.
 
@@ -355,7 +478,7 @@ return [{
 
 ---
 
-#### Node 11: Function — formatEscalation
+#### Node 13: Function — formatEscalation
 
 에스컬레이션 안내 메시지 생성.
 
@@ -387,7 +510,7 @@ return [{
 
 ---
 
-#### Node 12: Google Sheets — fetchRegulations
+#### Node 14: Google Sheets — fetchRegulations
 
 분류된 카테고리에 해당하는 규정 조회.
 
@@ -420,7 +543,7 @@ return [{ json: { regulations: limited } }];
 
 ---
 
-#### Node 13: HTTP Request — generateResponse (Gemini)
+#### Node 15: HTTP Request — generateResponse (Gemini)
 
 규정 기반 응답 생성.
 
@@ -440,7 +563,7 @@ return [{ json: { regulations: limited } }];
     {
       "role": "user",
       "parts": [{
-        "text": "[참조 규정]\n{{$('fetchRegulations').first().json.regulations}}\n\n[이전 대화]\n{{$('fetchHistory').first().json.conversationHistory}}\n\n[사용자 질문]\n{{$('parseMessage').first().json.messageText}}\n\n위 규정을 기반으로 답변해주세요. JSON 형식으로 응답:\n{\"answer\": \"답변 내용\", \"source\": \"근거 규정\", \"confidence\": 0.0~1.0}"
+        "text": "[참조 규정]\n{{$('fetchRegulations').first().json.regulations}}\n\n[현재 세션 대화]\n{{$('fetchHistory').first().json.conversationHistory}}\n\n[사용자 질문]\n{{$('parseMessage').first().json.messageText}}\n\n위 규정을 기반으로 답변해주세요. JSON 형식으로 응답:\n{\"answer\": \"답변 내용\", \"source\": \"근거 규정\", \"confidence\": 0.0~1.0}"
       }]
     }
   ],
@@ -453,7 +576,7 @@ return [{ json: { regulations: limited } }];
 
 ---
 
-#### Node 14: Function — formatResponse
+#### Node 16: Function — formatResponse
 
 Gemini 응답을 최종 포맷으로 변환. 신뢰도에 따른 분기 처리.
 
@@ -489,7 +612,7 @@ return [{
 
 ---
 
-#### Node 15: Google Sheets — saveHistory
+#### Node 17: Google Sheets — saveHistory
 
 대화 이력 저장 (사용자 메시지 + 봇 응답, 2행 추가).
 
@@ -500,7 +623,7 @@ return [{
 ```javascript
 const userId = $('parseMessage').first().json.userId;
 const now = new Date().toISOString();
-const sessionId = `${userId}_${now.split('T')[0].replace(/-/g, '')}`;
+const sessionId = $('fetchHistory').first().json.sessionId;
 
 return [
   // 사용자 메시지
@@ -534,7 +657,7 @@ return [
 
 ---
 
-#### Node 16: Execute Workflow — getToken
+#### Node 18: Execute Workflow — getToken
 
 서브 워크플로우(NaverWorks Auth) 호출하여 Access Token 획득.
 
@@ -543,7 +666,7 @@ return [
 
 ---
 
-#### Node 17: HTTP Request — sendMessage
+#### Node 19: HTTP Request — sendMessage
 
 네이버웍스 봇 API로 응답 전송.
 
